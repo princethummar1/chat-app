@@ -1,25 +1,44 @@
 const mongoose = require('mongoose');
-const Schema = mongoose.Schema;
 
-const MessageSchema = new Schema({
+const messageSchema = new mongoose.Schema({
   conversationId: {
-    type: Schema.Types.ObjectId,
+    type: mongoose.Schema.Types.ObjectId,
     ref: 'Conversation',
-    required: true,
+    required: true
   },
   sender: {
-    type: Schema.Types.ObjectId,
+    type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
-    required: true,
+    required: true
   },
   text: {
     type: String,
-    default: '',
+    required: true,
+    trim: true
   },
   imageUrl: {
     type: String,
-    default: null,
+    default: null
   },
-}, { timestamps: true });
+  createdAt: {
+    type: Date,
+    default: Date.now
+  }
+});
 
-module.exports = mongoose.model('Message', MessageSchema);
+// Update the conversation's lastMessage when a new message is saved
+messageSchema.post('save', async function() {
+  try {
+    await mongoose.model('Conversation').findByIdAndUpdate(
+      this.conversationId,
+      { 
+        lastMessage: this._id, 
+        lastMessageTime: this.createdAt 
+      }
+    );
+  } catch (error) {
+    console.error('Error updating conversation last message:', error);
+  }
+});
+
+module.exports = mongoose.model('Message', messageSchema);

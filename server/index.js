@@ -102,49 +102,17 @@ app.get('/messages/:userId1/:userId2', async (req, res) => {
   }
 });
 
+const onlineUsers = new Map(); // userId -> socket.id
+const userSockets = new Map(); // userId -> socket.id (for reverse lookup)
 
-
-//   console.log('A user connected:', socket.id);
-
-//   socket.on('sendMessage', async (messageData) => {
-//     // Save the message to the database
-//     const message = new Message({
-//       text: messageData.text,
-//       user: messageData.user,
-//     });
-//     await message.save();
-
-//     // Broadcast the message to all clients
-//     io.emit('receiveMessage', message);
-//   });
-
-//   socket.on('disconnect', () => {
-//     console.log('User disconnected:', socket.id);
-//   });
-// });
-const onlineUsers = new Map();
-const userSockets = new Map();
 io.on('connection', (socket) => {
-  // When a user logs in and registers with socket
-  // socket.on('register', async (userId) => {
-  //   onlineUsers.set(userId, socket.id);
+  console.log('User connected:', socket.id);
 
-  //   // Update user's online status and last seen
-  //   await User.findByIdAndUpdate(userId, { 
-  //     isOnline: true, 
-  //     lastSeen: new Date() 
-  //   });
-
-  //   // Broadcast updated online users (ids) to all clients
-  //   const users = Array.from(onlineUsers.keys());
-  //   io.emit('updateUserList', users);
-
-  //   // Emit user status update
-  //   io.emit('userStatusUpdate', { userId, isOnline: true, lastSeen: new Date() });
-  // });
-  // Replace the register event handler
   socket.on('register', async (userId) => {
-    userSockets.set(userId, socket.id); // Add this line
+    console.log('Registering user:', userId, 'with socket:', socket.id);
+    
+    // Store both mappings
+    userSockets.set(userId, socket.id);
     onlineUsers.set(userId, socket.id);
 
     // Update user's online status and last seen
@@ -196,6 +164,7 @@ io.on('connection', (socket) => {
       console.error('Error sending initial status:', error);
     }
   });
+
   // Heartbeat to refresh lastSeen without re-login
   socket.on('heartbeat', async (userId) => {
     try {
@@ -206,20 +175,40 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Listen for a private message
-  socket.on('privateMessage', async ({ senderId, recipientId, text }) => {
+  // Listen for a private message (update this handler to support groups)
+  socket.on('privateMessage', async ({ senderId, recipientId, text, conversationId }) => {
     try {
-      // Find or create a conversation between the two users
-      let conversation = await Conversation.findOne({
-        participants: { $all: [senderId, recipientId] },
-      });
+      let conversation;
 
-      if (!conversation) {
-        conversation = new Conversation({
-          participants: [senderId, recipientId],
-          unreadCount: new Map()
+      // If conversationId is provided, use it (for group messages)
+      if (conversationId) {
+        conversation = await Conversation.findById(conversationId);
+        if (!conversation) {
+          console.error('Conversation not found:', conversationId);
+          return;
+        }
+
+        // Verify sender is a participant
+        if (!conversation.participants.includes(senderId)) {
+          console.error('Sender is not a participant in this conversation');
+          return;
+        }
+
+        // For group messages, recipientId is the conversationId
+        recipientId = conversationId;
+      } else {
+        // For one-on-one chats, find or create conversation
+        conversation = await Conversation.findOne({
+          participants: { $all: [senderId, recipientId] },
         });
-        await conversation.save();
+
+        if (!conversation) {
+          conversation = new Conversation({
+            participants: [senderId, recipientId],
+            unreadCount: new Map()
+          });
+          await conversation.save();
+        }
       }
 
       // Create and save the new message
@@ -234,37 +223,77 @@ io.on('connection', (socket) => {
       conversation.lastMessage = message._id;
       conversation.lastMessageTime = message.createdAt;
 
-      // Increment unread count for recipient
-      const currentUnreadCount = conversation.unreadCount.get(recipientId) || 0;
-      conversation.unreadCount.set(recipientId, currentUnreadCount + 1);
+      // Increment unread count for all recipients except sender
+      for (const participantId of conversation.participants) {
+        if (participantId.toString() !== senderId) {
+          const currentUnreadCount = conversation.unreadCount.get(participantId.toString()) || 0;
+          conversation.unreadCount.set(participantId.toString(), currentUnreadCount + 1);
+        }
+      }
 
       await conversation.save();
 
-      // Send the message to the recipient if they are online
-      const recipientSocketId = onlineUsers.get(recipientId);
-      if (recipientSocketId) {
-        io.to(recipientSocketId).emit('receivePrivateMessage', {
-          ...message.toObject(),
-          conversationId: conversation._id,
-          unreadCount: conversation.unreadCount.get(recipientId)
-        });
+      // For group messages, send to all participants
+      if (conversation.isGroup) {
+        for (const participantId of conversation.participants) {
+          if (participantId.toString() !== senderId) {
+            const participantSocketId = onlineUsers.get(participantId.toString());
+            if (participantSocketId) {
+              io.to(participantSocketId).emit('receivePrivateMessage', {
+                ...message.toObject(),
+                conversationId: conversation._id,
+                unreadCount: conversation.unreadCount.get(participantId.toString())
+              });
 
-        // Show popup notification
-        // Try to include sender name
-        try {
-          const senderUser = await User.findById(senderId).select('username');
-          io.to(recipientSocketId).emit('messageNotification', {
-            senderId,
-            senderName: senderUser?.username,
-            message: text,
-            conversationId: conversation._id
+              // Show popup notification
+              try {
+                const senderUser = await User.findById(senderId).select('username');
+                io.to(participantSocketId).emit('messageNotification', {
+                  senderId,
+                  senderName: senderUser?.username,
+                  message: text,
+                  conversationId: conversation._id,
+                  isGroup: true,
+                  groupName: conversation.groupName
+                });
+              } catch (_) {
+                io.to(participantSocketId).emit('messageNotification', {
+                  senderId,
+                  message: text,
+                  conversationId: conversation._id,
+                  isGroup: true,
+                  groupName: conversation.groupName
+                });
+              }
+            }
+          }
+        }
+      } else {
+        // For one-on-one chats, send only to the recipient
+        const recipientSocketId = onlineUsers.get(recipientId);
+        if (recipientSocketId) {
+          io.to(recipientSocketId).emit('receivePrivateMessage', {
+            ...message.toObject(),
+            conversationId: conversation._id,
+            unreadCount: conversation.unreadCount.get(recipientId)
           });
-        } catch (_) {
-          io.to(recipientSocketId).emit('messageNotification', {
-            senderId,
-            message: text,
-            conversationId: conversation._id
-          });
+
+          // Show popup notification
+          try {
+            const senderUser = await User.findById(senderId).select('username');
+            io.to(recipientSocketId).emit('messageNotification', {
+              senderId,
+              senderName: senderUser?.username,
+              message: text,
+              conversationId: conversation._id
+            });
+          } catch (_) {
+            io.to(recipientSocketId).emit('messageNotification', {
+              senderId,
+              message: text,
+              conversationId: conversation._id
+            });
+          }
         }
       }
 
@@ -280,18 +309,86 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Image message via socket
-  socket.on('privateImageMessage', async ({ senderId, recipientId, imageUrl }) => {
+  // Update the markAsSeen handler for groups
+  socket.on('markAsSeen', async ({ conversationId, userId }) => {
     try {
-      let conversation = await Conversation.findOne({
-        participants: { $all: [senderId, recipientId] },
-      });
+      console.log(`[SERVER] Received 'markAsSeen' from user ${userId} for conversation ${conversationId}`);
+
+      const conversation = await Conversation.findById(conversationId);
       if (!conversation) {
-        conversation = new Conversation({
-          participants: [senderId, recipientId],
-          unreadCount: new Map()
-        });
+        console.log('[SERVER] Conversation not found.');
+        return;
+      }
+
+      // Reset unread count for this user
+      if (conversation.unreadCount.get(userId) > 0) {
+        conversation.unreadCount.set(userId, 0);
         await conversation.save();
+      }
+
+      // For one-on-one chats, notify the other participant
+      if (!conversation.isGroup) {
+        const otherParticipant = conversation.participants.find(p => p.toString() !== userId);
+        if (!otherParticipant) {
+          console.log('[SERVER] Other participant not found.');
+          return;
+        }
+
+        // Get the socket ID of the other participant
+        const recipientSocketId = userSockets.get(otherParticipant.toString());
+        console.log(`[SERVER] Found other participant: ${otherParticipant}. Socket ID: ${recipientSocketId}`);
+
+        if (recipientSocketId) {
+          console.log(`[SERVER] Emitting 'readReceiptUpdate' to socket ${recipientSocketId}`);
+          io.to(recipientSocketId).emit('readReceiptUpdate', {
+            conversationId,
+            userId,
+            seenAt: new Date(),
+          });
+        } else {
+          console.log(`[SERVER] User ${otherParticipant} is not connected via socket.`);
+        }
+      }
+
+    } catch (error) {
+      console.error('[SERVER] Error in markAsSeen:', error);
+    }
+  });
+
+  // Image message via socket - update to handle groups
+  socket.on('privateImageMessage', async ({ senderId, recipientId, imageUrl, conversationId }) => {
+    try {
+      let conversation;
+
+      // If conversationId is provided, it's a group message
+      if (conversationId) {
+        conversation = await Conversation.findById(conversationId);
+        if (!conversation) {
+          console.error('Conversation not found:', conversationId);
+          return;
+        }
+
+        // Verify sender is a participant
+        if (!conversation.participants.includes(senderId)) {
+          console.error('Sender is not a participant in this conversation');
+          return;
+        }
+
+        // For group messages, recipientId is the conversationId
+        recipientId = conversationId;
+      } else {
+        // For one-on-one chats, find or create conversation
+        conversation = await Conversation.findOne({
+          participants: { $all: [senderId, recipientId] },
+        });
+
+        if (!conversation) {
+          conversation = new Conversation({
+            participants: [senderId, recipientId],
+            unreadCount: new Map()
+          });
+          await conversation.save();
+        }
       }
 
       const message = new Message({
@@ -304,18 +401,50 @@ io.on('connection', (socket) => {
 
       conversation.lastMessage = message._id;
       conversation.lastMessageTime = message.createdAt;
-      const currentUnreadCount = conversation.unreadCount.get(recipientId) || 0;
-      conversation.unreadCount.set(recipientId, currentUnreadCount + 1);
+
+      // For group messages, increment unread count for all participants except sender
+      if (conversation.isGroup) {
+        for (const participantId of conversation.participants) {
+          if (participantId.toString() !== senderId) {
+            const currentUnreadCount = conversation.unreadCount.get(participantId.toString()) || 0;
+            conversation.unreadCount.set(participantId.toString(), currentUnreadCount + 1);
+          }
+        }
+      } else {
+        // For one-on-one, increment only for the recipient
+        const currentUnreadCount = conversation.unreadCount.get(recipientId) || 0;
+        conversation.unreadCount.set(recipientId, currentUnreadCount + 1);
+      }
+
       await conversation.save();
 
-      const recipientSocketId = onlineUsers.get(recipientId);
-      if (recipientSocketId) {
-        io.to(recipientSocketId).emit('receivePrivateMessage', {
-          ...message.toObject(),
-          conversationId: conversation._id,
-          unreadCount: conversation.unreadCount.get(recipientId)
-        });
+      // For group messages, send to all participants
+      if (conversation.isGroup) {
+        for (const participantId of conversation.participants) {
+          if (participantId.toString() !== senderId) {
+            const participantSocketId = onlineUsers.get(participantId.toString());
+            if (participantSocketId) {
+              io.to(participantSocketId).emit('receivePrivateMessage', {
+                ...message.toObject(),
+                conversationId: conversation._id,
+                unreadCount: conversation.unreadCount.get(participantId.toString())
+              });
+            }
+          }
+        }
+      } else {
+        // For one-on-one, send only to recipient
+        const recipientSocketId = onlineUsers.get(recipientId);
+        if (recipientSocketId) {
+          io.to(recipientSocketId).emit('receivePrivateMessage', {
+            ...message.toObject(),
+            conversationId: conversation._id,
+            unreadCount: conversation.unreadCount.get(recipientId)
+          });
+        }
       }
+
+      // Always send back to sender
       socket.emit('receivePrivateMessage', {
         ...message.toObject(),
         conversationId: conversation._id,
@@ -326,59 +455,32 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Example Server-Side Socket Logic
+  // Remove this entire handler or modify it to use the same logic as privateMessage
+  socket.on('sendGroupMessage', async (data) => {
+    // This can be removed since we're handling group messages in privateMessage
+  });
 
-  // Assume you have a map like this at the top level of your socket file
-  // let userSockets = {};
-  // and you populate it on 'register' or 'connection'
-  // userSockets[userId] = socket.id;
-
-  socket.on('markAsSeen', async ({ conversationId, userId }) => {
-    try {
-      console.log(`[SERVER] Received 'markAsSeen' from user ${userId} for conversation ${conversationId}`);
-
-      const conversation = await Conversation.findById(conversationId);
-      if (!conversation) {
-        console.log('[SERVER] Conversation not found.');
-        return;
-      }
-
-      // Find the other participant
-      const otherParticipant = conversation.participants.find(p => p.toString() !== userId);
-      if (!otherParticipant) {
-        console.log('[SERVER] Other participant not found.');
-        return;
-      }
-
-      // Get the socket ID of the other participant
-      const recipientSocketId = userSockets.get(otherParticipant.toString());
-      console.log(`[SERVER] Found other participant: ${otherParticipant}. Socket ID: ${recipientSocketId}`);
-
-      if (recipientSocketId) {
-        console.log(`[SERVER] Emitting 'readReceiptUpdate' to socket ${recipientSocketId}`);
-        io.to(recipientSocketId).emit('readReceiptUpdate', {
-          conversationId,
-          userId,
-          seenAt: new Date(),
-        });
-      } else {
-        console.log(`[SERVER] User ${otherParticipant} is not connected via socket.`);
-      }
-    } catch (error) {
-      console.error('[SERVER] Error in markAsSeen:', error);
-    }
+  // Similar handler for group images
+  socket.on('sendGroupImage', async (data) => {
+    // Similar logic but for image messages
   });
 
   socket.on('disconnect', () => {
+    console.log('User disconnected:', socket.id);
+    
+    // Find which user was associated with this socket
     let disconnectedUserId = null;
     for (let [userId, socketId] of userSockets.entries()) {
       if (socketId === socket.id) {
+        disconnectedUserId = userId;
         userSockets.delete(userId);
         break;
       }
     }
 
     if (disconnectedUserId) {
+      console.log('Disconnected user ID:', disconnectedUserId);
+      
       // Delay marking as offline to handle quick refreshes
       setTimeout(async () => {
         // Check if the user has reconnected with a new socket ID
@@ -392,6 +494,7 @@ io.on('connection', (socket) => {
         // We only mark them as offline if they are TRULY gone (no other sessions open)
         if (!onlineUsers.has(disconnectedUserId)) {
           try {
+            console.log('Marking user as offline:', disconnectedUserId);
             await User.findByIdAndUpdate(disconnectedUserId, {
               isOnline: false,
               lastSeen: new Date()
@@ -409,13 +512,14 @@ io.on('connection', (socket) => {
           } catch (err) {
             console.error('Error updating user status on disconnect:', err);
           }
+        } else {
+          console.log('User reconnected with different socket, not marking as offline');
         }
-
       }, 5000); // 5-second delay
     }
   });
-
 });
+
 const PORT = 3001;
 server.listen(PORT, () => {
   console.log(`🚀 Server is running on port ${PORT}`);
